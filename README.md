@@ -6,13 +6,12 @@
 
 backuphelper is a bash script that writes rotating `tar.gz` backups from one yaml config: local paths, the files of git checkouts that are not in git and the output of any bash command (database dumps, remote files).
 
-## installation / update
+## installation
 
 ```sh
 git clone https://github.com/vielhuber/backuphelper.git
 cd backuphelper
 cp config.yaml.example config.yaml
-./backuphelper.sh
 ```
 
 requirements: `bash`, `yq` (jq wrapper), `jq`, `tar`, `gzip`, `git`, `flock`
@@ -20,46 +19,40 @@ requirements: `bash`, `yq` (jq wrapper), `jq`, `tar`, `gzip`, `git`, `flock`
 ## configuration
 
 ```yaml
-target: /mnt/h/backuphelper
-keep: 14
-interval: 20
-exclude: [node_modules, vendor, .cache]
+# every top level key is a job that writes <target>/<job>-YYYY-MM-DD-HHMMSS.tar.gz
+local:
+    # folder of the archives; the job is skipped while it is missing (e.g. an unplugged usb drive)
+    target: /mnt/h/backuphelper
+    # number of archives to keep
+    keep: 14
+    # optional: minimum hours between two archives, so an hourly cron writes about one per day
+    interval: 20
+    # optional: tar exclude patterns
+    exclude: [node_modules, vendor, .cache, syncdb/cache]
+    sources:
+        # every folder below path except skip; git checkouts only with untracked, ignored and modified files
+        - type: git
+          path: /var/www
+          skip: [_environments, big-uploads]
+        # a file or folder
+        - type: path
+          path: /var/lib/lamp
+        # output of a bash command, stored as command-<position in this list> (here command-3)
+        - type: command
+          command: mysqldump --all-databases --single-transaction --routines --events --triggers
 
-jobs:
-    local:
-        sources:
-            - type: git
-              path: /var/www
-              skip: [big-uploads]
-            - type: path
-              path: /var/lib/lamp
-            - type: command
-              name: mysql.sql
-              command: mysqldump --all-databases --single-transaction
-              check: '^-- Dump completed on '
-
-    remote-host:
-        target: /mnt/o/backups/remote-host
-        keep: 7
-        interval: 160
-        sources:
-            - type: command
-              name: uploads.tar
-              command: ssh user@example.com 'tar -C www -cf - uploads'
+remote-host:
+    target: /mnt/o/backups/remote-host
+    keep: 7
+    interval: 160
+    sources:
+        # the password is passed via stdin, so it neither shows up in the remote command line nor in a process list
+        - type: command
+          command: |
+              printf '%s\n' 'secret' | ssh -o BatchMode=yes user@example.com 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; mysqldump --single-transaction -h localhost -u user database'
+        - type: command
+          command: ssh -o BatchMode=yes user@example.com 'tar -C www -cf - uploads || [ $? -eq 1 ]'
 ```
-
-**settings** (top level as default, overridable per job):
-
-- `target`: folder of the archives `<job>-YYYY-MM-DD-HHMMSS.tar.gz`; a missing folder skips the job
-- `keep`: archives kept per job (default `7`)
-- `interval`: minimum hours between two archives of a job (default `0`)
-- `exclude`: tar exclude patterns (top level and job)
-
-**sources:**
-
-- `path`: absolute file or folder
-- `git`: every folder below `path` except `skip`; git checkouts only with untracked, ignored and modified files
-- `command`: output of a bash command, stored as `name`; `check` is an extended regex the output must match
 
 ## usage
 

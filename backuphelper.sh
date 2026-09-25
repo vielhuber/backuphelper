@@ -43,15 +43,14 @@ contains() {
 
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
 SETTINGS=$(yq -c . "$CONFIG") || fail "config $CONFIG is no valid yaml"
-mapfile -t JOBS < <(jq -r '.jobs // {} | keys_unsorted[]' <<< "$SETTINGS")
+mapfile -t JOBS < <(jq -r '. // {} | keys_unsorted[]' <<< "$SETTINGS")
 (( ${#JOBS[@]} )) || fail "config $CONFIG has no jobs"
 for job in "${SELECTED[@]}"; do
     contains "$job" "${JOBS[@]}" || fail "unknown job $job"
 done
 
-# job setting with fallback to the top level and a default
 setting() {
-    jq -r --arg job "$job" --arg key "$1" --arg default "$2" '.jobs[$job][$key] // .[$key] // $default' <<< "$SETTINGS"
+    jq -r --arg job "$job" --arg key "$1" --arg default "$2" '.[$job][$key] // $default' <<< "$SETTINGS"
 }
 
 # field of the current source; lists are printed one entry per line
@@ -87,14 +86,12 @@ collect_git() {
     done
 }
 
+# the output is named after the position of the source, so no part of the command (e.g. a password) ends up in a file name
 collect_command() {
-    local name command check
-    name=$(field name)
+    local name="command-$1" command
     command=$(field command)
-    check=$(field check)
-    [[ -n "$name" && "$name" != */* && -n "$command" ]] || fail "$job: command source needs name and command"
+    [[ -n "$command" ]] || fail "$job: command source $1 needs a command"
     bash -c "$command" < /dev/null > "$staging/$name" || fail "$job: $name failed with exit status $?"
-    if [[ -n "$check" ]] && ! grep -Eq -- "$check" "$staging/$name"; then fail "$job: $name does not match the check $check"; fi
     printf '%s\0' "$staging/$name" >> "$list"
 }
 
@@ -103,9 +100,9 @@ cleanup() {
 }
 
 run_job() {
-    local target keep interval newest source sources exclude archive status=0
+    local target keep interval newest index source sources exclude archive status=0
     target=$(setting target "")
-    keep=$(setting keep 7)
+    keep=$(setting keep "")
     interval=$(setting interval 0)
     [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "job names may only contain letters, digits, _ and -"
     [[ "$target" = /* ]] || fail "$job needs an absolute target"
@@ -125,22 +122,23 @@ run_job() {
     list="$staging/.files"
     trap cleanup EXIT
     : > "$list"
-    mapfile -t sources < <(jq -c --arg job "$job" '.jobs[$job].sources // [] | .[]' <<< "$SETTINGS")
+    mapfile -t sources < <(jq -c --arg job "$job" '.[$job].sources // [] | .[]' <<< "$SETTINGS")
     (( ${#sources[@]} )) || fail "$job has no sources"
-    for source in "${sources[@]}"; do
+    for index in "${!sources[@]}"; do
+        source=${sources[$index]}
         case "$(field type)" in
             path)
                 [[ "$(field path)" = /* ]] || fail "$job: path source needs an absolute path"
                 printf '%s\0' "$(field path)" >> "$list"
                 ;;
             git) collect_git ;;
-            command) collect_command ;;
+            command) collect_command "$((index + 1))" ;;
             *) fail "$job: source type must be path, git or command" ;;
         esac
     done
 
     archive="$target/$job-$(date +%Y-%m-%d-%H%M%S).tar.gz"
-    mapfile -t exclude < <(jq -r --arg job "$job" '(.exclude // []) + (.jobs[$job].exclude // []) | .[]' <<< "$SETTINGS")
+    mapfile -t exclude < <(jq -r --arg job "$job" '.[$job].exclude // [] | .[]' <<< "$SETTINGS")
     # exit status 1 only reports files that changed while they were read (open sqlite databases)
     tar -czf "$archive.partial" --ignore-failed-read --warning=no-file-changed "${exclude[@]/#/--exclude=}" \
         --transform "s|^${staging#/}/||" -C / --null -T <(sed -z 's|^/||' "$list") || status=$?
