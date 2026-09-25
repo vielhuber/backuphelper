@@ -43,7 +43,6 @@ contains() {
 
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
 SETTINGS=$(yq -c . "$CONFIG") || fail "config $CONFIG is no valid yaml"
-FTPSH=$(jq -r '.ftpsh // "ftpsh"' <<< "$SETTINGS")
 mapfile -t JOBS < <(jq -r '.jobs // {} | keys_unsorted[]' <<< "$SETTINGS")
 (( ${#JOBS[@]} )) || fail "config $CONFIG has no jobs"
 for job in "${SELECTED[@]}"; do
@@ -99,28 +98,7 @@ collect_command() {
     printf '%s\0' "$staging/$name" >> "$list"
 }
 
-# the remote tar gets a random name and is removed again, also when the job fails (see cleanup)
-collect_ftpsh() {
-    local name env path exclude status=0
-    name=$(field name)
-    env=$(field env)
-    path=$(field path)
-    [[ -n "$name" && "$name" != */* && -n "$env" && -n "$path" ]] || fail "$job: ftpsh source needs name, env and path"
-    mapfile -t exclude < <(field exclude)
-    remote_env=$env
-    remote="backuphelper_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n').tar"
-    "$FTPSH" --env "$env" tar -cf "$remote" --exclude="$remote" "${exclude[@]/#/--exclude=}" --warning=no-file-changed "$path" \
-        < /dev/null > /dev/null || status=$?
-    (( status <= 1 )) || fail "$job: remote tar of $path failed with exit status $status"
-    "$FTPSH" --env "$env" --download "$remote" < /dev/null > "$staging/$name" || fail "$job: download of $name failed"
-    tar -tf "$staging/$name" > /dev/null || fail "$job: $name is no valid tar"
-    "$FTPSH" --env "$env" rm -f -- "$remote" < /dev/null > /dev/null
-    remote=
-    printf '%s\0' "$staging/$name" >> "$list"
-}
-
 cleanup() {
-    if [[ -n "$remote" ]]; then "$FTPSH" --env "$remote_env" rm -f -- "$remote" < /dev/null > /dev/null || true; fi
     rm -rf -- "$staging"
 }
 
@@ -145,8 +123,6 @@ run_job() {
     log "$job: started"
     staging=$(mktemp -d /tmp/backuphelper.XXXXXX)
     list="$staging/.files"
-    remote=
-    remote_env=
     trap cleanup EXIT
     : > "$list"
     mapfile -t sources < <(jq -c --arg job "$job" '.jobs[$job].sources // [] | .[]' <<< "$SETTINGS")
@@ -159,8 +135,7 @@ run_job() {
                 ;;
             git) collect_git ;;
             command) collect_command ;;
-            ftpsh) collect_ftpsh ;;
-            *) fail "$job: source type must be path, git, command or ftpsh" ;;
+            *) fail "$job: source type must be path, git or command" ;;
         esac
     done
 
