@@ -41,6 +41,9 @@ contains() {
     return 1
 }
 
+for tool in yq jq tar gzip git flock; do
+    command -v "$tool" > /dev/null || fail "$tool is missing"
+done
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
 SETTINGS=$(yq -c . "$CONFIG") || fail "config $CONFIG is no valid yaml"
 mapfile -t JOBS < <(jq -r '. // {} | keys_unsorted[]' <<< "$SETTINGS")
