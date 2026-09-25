@@ -33,6 +33,11 @@ fail() {
     exit 1
 }
 
+# live status that overwrites itself; only in a terminal, so cron logs stay clean
+progress() {
+    if [[ -t 2 ]]; then printf '\r\033[K%s' "${1:+   $1}" >&2; fi
+}
+
 contains() {
     local item
     for item in "${@:2}"; do
@@ -41,7 +46,7 @@ contains() {
     return 1
 }
 
-for tool in yq jq tar gzip git flock; do
+for tool in yq jq tar gzip git flock pv; do
     command -v "$tool" > /dev/null || fail "$tool is missing"
 done
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
@@ -71,12 +76,16 @@ archives() {
 
 # git checkouts below the path contribute untracked, ignored and modified files, other folders everything
 collect_git() {
-    local path folder skip
+    local path folder skip folders position=0
     path=$(field path)
     [[ "$path" = /* ]] || fail "$job: git source needs an absolute path"
     mapfile -t skip < <(field skip)
-    for folder in "$path"/*/; do
+    folders=("$path"/*/)
+    log "📂 $job $1: git $path (${#folders[@]} folders)"
+    for folder in "${folders[@]}"; do
         folder=${folder%/}
+        position=$((position + 1))
+        progress "$position/${#folders[@]} ${folder##*/}"
         if contains "${folder##*/}" "${skip[@]}"; then continue; fi
         if [[ ! -e "$folder/.git" ]]; then
             printf '%s\0' "$folder" >> "$list"
@@ -87,6 +96,7 @@ collect_git() {
             git -C "$folder" ls-files -z --others --ignored --exclude-standard --directory
         } < /dev/null | while IFS= read -r -d '' file; do printf '%s\0' "$folder/$file"; done >> "$list"
     done
+    progress
 }
 
 # the output is named after the position of the source, so no part of the command (e.g. a password) ends up in a file name
@@ -94,7 +104,8 @@ collect_command() {
     local name="command-$1" command
     command=$(field command)
     [[ -n "$command" ]] || fail "$job: command source $1 needs a command"
-    bash -c "$command" < /dev/null > "$staging/$name" || fail "$job: $name failed with exit status $?"
+    log "⚙️ $job $2: $name"
+    bash -c "$command" < /dev/null | pv -N "$name" > "$staging/$name" || fail "$job: $name failed with exit status $?"
     printf '%s\0' "$staging/$name" >> "$list"
 }
 
@@ -103,7 +114,7 @@ cleanup() {
 }
 
 run_job() {
-    local target keep interval newest index source sources exclude archive status=0
+    local target keep interval newest index step source sources exclude archive size outdated status=0
     target=$(setting target "")
     keep=$(setting keep "")
     interval=$(setting interval 0)
@@ -115,12 +126,18 @@ run_job() {
         return 0
     fi
     exec 9> "/tmp/backuphelper-$(printf '%s' "$target/$job" | md5sum | cut -c1-32).lock"
-    flock -n 9 || return 0
+    if ! flock -n 9; then
+        if [[ -t 1 ]]; then log "🔒 $job: already running; skipped"; fi
+        return 0
+    fi
     rm -f -- "$target/$job"-*.partial
     newest=$(archives | head -n 1)
-    if [[ -n "$newest" ]] && (( $(date +%s) - $(stat -c %Y "$newest") < interval * 3600 )); then return 0; fi
+    if [[ -n "$newest" ]] && (( $(date +%s) - $(stat -c %Y "$newest") < interval * 3600 )); then
+        if [[ -t 1 ]]; then log "⏭️ $job: last archive is younger than $interval hours; skipped"; fi
+        return 0
+    fi
 
-    log "$job: started"
+    log "🚀 $job: started"
     staging=$(mktemp -d /tmp/backuphelper.XXXXXX)
     list="$staging/.files"
     trap cleanup EXIT
@@ -129,25 +146,38 @@ run_job() {
     (( ${#sources[@]} )) || fail "$job has no sources"
     for index in "${!sources[@]}"; do
         source=${sources[$index]}
+        step="[$((index + 1))/${#sources[@]}]"
         case "$(field type)" in
             path)
                 [[ "$(field path)" = /* ]] || fail "$job: path source needs an absolute path"
+                log "📄 $job $step: path $(field path)"
                 printf '%s\0' "$(field path)" >> "$list"
                 ;;
-            git) collect_git ;;
-            command) collect_command "$((index + 1))" ;;
+            git) collect_git "$step" ;;
+            command) collect_command "$((index + 1))" "$step" ;;
             *) fail "$job: source type must be path, git or command" ;;
         esac
     done
 
     archive="$target/$job-$(date +%Y-%m-%d-%H%M%S).tar.gz"
     mapfile -t exclude < <(jq -r --arg job "$job" '.[$job].exclude // [] | .[]' <<< "$SETTINGS")
+    # the size before exclude patterns only drives the progress estimate
+    size=$({ du -cb --files0-from="$list" 2> /dev/null || true; } | tail -n 1 | cut -f1)
+    log "📦 $job: packing about $(numfmt --to=iec-i --suffix=B "${size:-0}")"
     # exit status 1 only reports files that changed while they were read (open sqlite databases)
-    tar -czf "$archive.partial" --ignore-failed-read --warning=no-file-changed "${exclude[@]/#/--exclude=}" \
-        --transform "s|^${staging#/}/||" -C / --null -T <(sed -z 's|^/||' "$list") || status=$?
+    {
+        tar -cf - --ignore-failed-read --warning=no-file-changed "${exclude[@]/#/--exclude=}" \
+            --transform "s|^${staging#/}/||" -C / --null -T <(sed -z 's|^/||' "$list") \
+            || echo "$?" > "$staging/.tar-status"
+    } | pv -s "${size:-0}" | gzip > "$archive.partial"
+    if [[ -f "$staging/.tar-status" ]]; then status=$(< "$staging/.tar-status"); fi
     (( status <= 1 )) || fail "$job: tar failed with exit status $status"
     mv -- "$archive.partial" "$archive"
-    archives | tail -n +$((keep + 1)) | while IFS= read -r outdated; do rm -f -- "$outdated"; done
+    mapfile -t outdated < <(archives | tail -n +$((keep + 1)))
+    if (( ${#outdated[@]} )); then
+        rm -f -- "${outdated[@]}"
+        log "🧹 $job: removed ${#outdated[@]} old archive(s)"
+    fi
     log "✅ $job: $archive ($(du -h "$archive" | cut -f1))"
 }
 
