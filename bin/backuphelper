@@ -1,0 +1,29 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+foreach (
+    [__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php', __DIR__ . '/../../../../autoload.php']
+    as $autoload_path
+) {
+    if (is_file($autoload_path)) {
+        require_once $autoload_path;
+        break;
+    }
+}
+
+use vielhuber\backuphelper\backuphelper;
+use vielhuber\backuphelper\BackupException;
+
+if ($argc < 2) {
+    fwrite(STDERR, 'usage: backuphelper <config.yaml> [job ...]' . PHP_EOL);
+    exit(2);
+}
+// archives contain secrets such as keys and database dumps
+umask(0077);
+try {
+    exit((new backuphelper())->config($argv[1])->run(...array_slice($argv, 2)) ? 0 : 1);
+} catch (BackupException $exception) {
+    fwrite(STDERR, '❌ ' . $exception->getMessage() . PHP_EOL);
+    exit(1);
+}

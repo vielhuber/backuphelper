@@ -1,0 +1,18 @@
+{
+    "singleQuote": true,
+    "editorconfig": false,
+    "overrides": [
+        {
+            "files": ["**/*.php"],
+            "options": {
+                "trailingCommaPHP": false,
+                "phpVersion": "8.5",
+                "plugins": ["@prettier/plugin-php"]
+            }
+        }
+    ],
+    "tabWidth": 4,
+    "printWidth": 120,
+    "trailingComma": "none",
+    "arrowParens": "avoid"
+}

@@ -1,0 +1,48 @@
+# defaults for every job; a job may override target, keep and interval and add exclude patterns
+target: /mnt/h/backuphelper
+keep: 14
+interval: 20
+ftpsh: /var/www/ftpsh/ftpsh.sh
+exclude: [node_modules, vendor, venv, .venv, __pycache__, .cache, .tmp]
+
+jobs:
+    local:
+        exclude: [syncdb/cache]
+        sources:
+            - type: git
+              path: /var/www
+              skip: [_environments, big-uploads]
+            - type: git
+              path: /var/www/_environments
+            - type: path
+              path: /var/lib/lamp
+            - type: command
+              name: mysql.sql
+              command: mysqldump --all-databases --single-transaction --routines --events --triggers
+              check: '^-- Dump completed on '
+            - type: command
+              name: postgres.sql
+              command: pg_dumpall -U postgres
+
+    shared-host:
+        keep: 7
+        sources:
+            - type: command
+              name: database.sql
+              command: |
+                  printf '%s\n' 'secret' | ssh -o BatchMode=yes user@example.com 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; mysqldump --single-transaction -h localhost -u user database'
+              check: '^-- Dump completed on '
+            - type: command
+              name: uploads.tar
+              command: ssh -o BatchMode=yes user@example.com 'tar -C www -cf - uploads || [ $? -eq 1 ]'
+
+    ftp-only-host:
+        target: /mnt/o/backups/ftp-only-host
+        keep: 2
+        interval: 160
+        sources:
+            - type: ftpsh
+              name: files.tar
+              env: ftp-only-host.env
+              path: .
+              exclude: [.git, cache, tmp, logs]

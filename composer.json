@@ -1,0 +1,20 @@
+{
+    "name": "vielhuber/backuphelper",
+    "description": "Rotating tar.gz backups of local folders, git leftovers, command output and ftpsh hosts from one yaml config.",
+    "license": "MIT",
+    "require": {
+        "php": "^8.4",
+        "symfony/yaml": "^8.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "vielhuber\\backuphelper\\": "src/"
+        }
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^13"
+    },
+    "bin": [
+        "bin/backuphelper"
+    ]
+}
