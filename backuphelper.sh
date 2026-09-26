@@ -74,6 +74,17 @@ archives() {
     done | sort -r
 }
 
+# tar drops these anyway; leaving them out of the list keeps the size estimate honest
+excluded() {
+    local pattern name=${1%/}
+    name=${name##*/}
+    for pattern in "${exclude[@]}"; do
+        # unquoted, so the pattern matches like a tar exclude glob
+        if [[ "$name" == $pattern ]]; then return 0; fi
+    done
+    return 1
+}
+
 # git checkouts below the path contribute untracked, ignored and modified files, other folders everything
 collect_git() {
     local path folder skip folders position=0
@@ -94,7 +105,10 @@ collect_git() {
         {
             git -C "$folder" ls-files -z --others --modified --exclude-standard
             git -C "$folder" ls-files -z --others --ignored --exclude-standard --directory
-        } < /dev/null | while IFS= read -r -d '' file; do printf '%s\0' "$folder/$file"; done >> "$list"
+        } < /dev/null | while IFS= read -r -d '' file; do
+            # --modified also lists deleted files
+            if [[ -e "$folder/$file" || -L "$folder/$file" ]] && ! excluded "$file"; then printf '%s\0' "$folder/$file"; fi
+        done >> "$list"
     done
     progress
 }
@@ -142,6 +156,7 @@ run_job() {
     list="$staging/.files"
     trap cleanup EXIT
     : > "$list"
+    mapfile -t exclude < <(jq -r --arg job "$job" '.[$job].exclude // [] | .[]' <<< "$SETTINGS")
     mapfile -t sources < <(jq -c --arg job "$job" '.[$job].sources // [] | .[]' <<< "$SETTINGS")
     (( ${#sources[@]} )) || fail "$job has no sources"
     for index in "${!sources[@]}"; do
@@ -160,9 +175,8 @@ run_job() {
     done
 
     archive="$target/$job-$(date +%Y-%m-%d-%H%M%S).tar.gz"
-    mapfile -t exclude < <(jq -r --arg job "$job" '.[$job].exclude // [] | .[]' <<< "$SETTINGS")
-    # the size before exclude patterns only drives the progress estimate
-    size=$({ du -cb --files0-from="$list" 2> /dev/null || true; } | tail -n 1 | cut -f1)
+    # only drives the progress estimate; du applies name patterns like tar, path patterns are ignored
+    size=$({ du -cb "${exclude[@]/#/--exclude=}" --files0-from="$list" 2> /dev/null || true; } | tail -n 1 | cut -f1)
     log "📦 $job: packing about $(numfmt --to=iec-i --suffix=B "${size:-0}")"
     # exit status 1 only reports files that changed while they were read (open sqlite databases)
     {
