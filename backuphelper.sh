@@ -50,6 +50,10 @@ for tool in yq jq tar gzip git flock pv; do
     command -v "$tool" > /dev/null || fail "$tool is missing"
 done
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
+CONFIG=$(readlink -f "$CONFIG")
+# Different scheduled jobs share one queue, including manual calls with the same config.
+exec 8> "/tmp/backuphelper-run-$(printf '%s' "$CONFIG" | md5sum | cut -c1-32).lock"
+flock 8
 SETTINGS=$(yq -c . "$CONFIG") || fail "config $CONFIG is no valid yaml"
 mapfile -t JOBS < <(jq -r '. // {} | keys_unsorted[]' <<< "$SETTINGS")
 (( ${#JOBS[@]} )) || fail "config $CONFIG has no jobs"
@@ -128,13 +132,15 @@ cleanup() {
 }
 
 run_job() {
-    local target keep interval newest index step source sources exclude archive size outdated status=0
+    local target keep index step source sources exclude archive size outdated status=0
     target=$(setting target "")
     keep=$(setting keep "")
-    interval=$(setting interval 0)
+    if jq -e --arg job "$job" '.[$job] | has("interval")' <<< "$SETTINGS" > /dev/null; then
+        fail "$job: replace interval with schedule and install the systemd timers"
+    fi
     [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "job names may only contain letters, digits, _ and -"
     [[ "$target" = /* ]] || fail "$job needs an absolute target"
-    [[ "$keep" =~ ^[1-9][0-9]*$ && "$interval" =~ ^[0-9]+$ ]] || fail "$job needs keep >= 1 and interval >= 0 (hours)"
+    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || fail "$job needs keep >= 1"
     if [[ ! -d "$target" ]]; then
         log "⚠️ $job: target $target is missing; skipped"
         return 0
@@ -145,12 +151,6 @@ run_job() {
         return 0
     fi
     rm -f -- "$target/$job"-*.partial
-    newest=$(archives | head -n 1)
-    if [[ -n "$newest" ]] && (( $(date +%s) - $(stat -c %Y "$newest") < interval * 3600 )); then
-        if [[ -t 1 ]]; then log "⏭️ $job: last archive is younger than $interval hours; skipped"; fi
-        return 0
-    fi
-
     log "🚀 $job: started"
     staging=$(mktemp -d /tmp/backuphelper.XXXXXX)
     list="$staging/.files"
