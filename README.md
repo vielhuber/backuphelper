@@ -62,17 +62,9 @@ remote:
 
 ## scheduling
 
-`schedule` uses five cron fields: `minute hour day-of-month month day-of-week`. Lists, ranges, steps and month/weekday names are supported; `0` and `7` both mean Sunday. Systemd expressions and aliases such as `@daily` are rejected.
-
-Add **one line** to `crontab -e`:
-
 ```sh
 * * * * * /path/to/backuphelper/backuphelper.sh >> /path/to/backuphelper.log 2>&1
 ```
-
-Backuphelper runs due jobs sequentially. Missed appointments are caught up once, based on the latest successful archive; a new job starts checking from the config file's modification time. Polls while a backup is running are skipped. Failed backups are retried on the next poll.
-
-`./backuphelper.sh local remote` runs those jobs manually, regardless of their scheduled time. Jobs without `schedule` run only when explicitly selected. Existing archives are retained.
 
 ## tests
 
