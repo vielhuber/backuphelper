@@ -51,9 +51,9 @@ for tool in yq jq tar gzip git flock pv; do
 done
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
 CONFIG=$(readlink -f "$CONFIG")
-# Different scheduled jobs share one queue, including manual calls with the same config.
+# Manual calls wait for the current run; cron polls skip it without building a queue.
 exec 8> "/tmp/backuphelper-run-$(printf '%s' "$CONFIG" | md5sum | cut -c1-32).lock"
-flock 8
+if (( ${#SELECTED[@]} )); then flock 8; else flock -n 8 || exit 0; fi
 SETTINGS=$(yq -c . "$CONFIG") || fail "config $CONFIG is no valid yaml"
 mapfile -t JOBS < <(jq -r '. // {} | keys_unsorted[]' <<< "$SETTINGS")
 (( ${#JOBS[@]} )) || fail "config $CONFIG has no jobs"
@@ -132,11 +132,15 @@ cleanup() {
 }
 
 run_job() {
-    local target keep index step source sources exclude archive size outdated status=0
+    local target keep schedule='' newest since index step source sources exclude archive size outdated status=0
     target=$(setting target "")
     keep=$(setting keep "")
     if jq -e --arg job "$job" '.[$job] | has("interval")' <<< "$SETTINGS" > /dev/null; then
-        fail "$job: replace interval with schedule and install the systemd timers"
+        fail "$job: replace interval with a five-field cron schedule"
+    fi
+    if jq -e --arg job "$job" '.[$job] | has("schedule")' <<< "$SETTINGS" > /dev/null; then
+        schedule=$(setting schedule "")
+        python3 "$SCRIPT_DIR/cron_schedule.py" "$schedule" > /dev/null || fail "$job needs a five-field cron schedule"
     fi
     [[ "$job" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "job names may only contain letters, digits, _ and -"
     [[ "$target" = /* ]] || fail "$job needs an absolute target"
@@ -149,6 +153,18 @@ run_job() {
     if ! flock -n 9; then
         if [[ -t 1 ]]; then log "🔒 $job: already running; skipped"; fi
         return 0
+    fi
+    if (( ! ${#SELECTED[@]} )); then
+        [[ -n "$schedule" ]] || return 0
+        newest=$(archives | head -n 1)
+        since=$(stat -c %Y "${newest:-$CONFIG}")
+        if python3 "$SCRIPT_DIR/cron_schedule.py" "$schedule" "$since" "$(date +%s)"; then
+            :
+        else
+            status=$?
+            if (( status == 1 )); then return 0; fi
+            fail "$job: checking the cron schedule failed"
+        fi
     fi
     rm -f -- "$target/$job"-*.partial
     log "🚀 $job: started"

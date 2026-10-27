@@ -15,8 +15,8 @@ local:
     target: /mnt/h/backuphelper
     # number of archives to keep
     keep: 14
-    # optional: systemd calendar expression; omitted jobs only run manually
-    schedule: '*-*-* 01:00:00'
+    # optional: five cron fields (minute hour day-of-month month day-of-week); omitted jobs only run manually
+    schedule: '0 1 * * *'
     # optional: tar exclude patterns
     exclude: [node_modules, vendor, .cache, syncdb/cache]
 
@@ -30,4 +30,4 @@ remote:
           command: ssh -o BatchMode=yes user@example.com 'tar -C www -cf - uploads || [ $? -eq 1 ]'
     target: /mnt/o/backups/remote
     keep: 7
-    schedule: 'Sun *-*-* 00:30:00'
+    schedule: '30 0 * * 0'

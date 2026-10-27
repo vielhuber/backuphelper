@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -30,8 +29,13 @@ class BackupTest(unittest.TestCase):
         return subprocess.run([str(ROOT / 'backuphelper.sh'), '--config', str(self.config), *jobs],
                               capture_output=True, text=True, timeout=15)
 
+    def daily_job(self):
+        return {'target': str(self.target), 'keep': 2,
+                'schedule': f'0 {(time.localtime().tm_hour + 2) % 24} * * *',
+                'sources': [{'type': 'path', 'path': str(self.source)}]}
+
     def test_manual_backup_runs_with_or_without_a_schedule(self):
-        for schedule in (None, '*-*-* 01:00:00'):
+        for schedule in (None, '0 1 * * *'):
             with self.subTest(schedule=schedule):
                 job = {'target': str(self.target), 'keep': 2,
                        'sources': [{'type': 'path', 'path': str(self.source)}]}
@@ -52,6 +56,86 @@ class BackupTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn('schedule', result.stdout + result.stderr)
         self.assertEqual([], list(self.target.iterdir()))
+
+    def test_manual_calls_also_reject_non_cron_schedules(self):
+        for schedule in ['daily', '*-*-* 01:00:00', '60 1 * * *', None, False]:
+            with self.subTest(schedule=schedule):
+                self.write_config({'local': {'target': str(self.target), 'keep': 2, 'schedule': schedule,
+                                            'sources': [{'type': 'path', 'path': str(self.source)}]}})
+                result = self.run_backup()
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual([], list(self.target.iterdir()))
+
+    def test_missed_backup_is_caught_up_once(self):
+        self.write_config({'local': self.daily_job()})
+        previous = self.target / 'local-2020-01-01-000000.tar.gz'
+        with tarfile.open(previous, 'w:gz'):
+            pass
+        old = time.time() - 48 * 3600
+        os.utime(previous, (old, old))
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        archives = {p.name: p.stat().st_mtime_ns for p in self.target.iterdir()}
+        self.assertEqual(2, len(archives))
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(archives, {p.name: p.stat().st_mtime_ns for p in self.target.iterdir()})
+
+    def test_new_job_waits_for_a_term_after_config_creation(self):
+        self.write_config({'local': self.daily_job()})
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual([], list(self.target.iterdir()))
+        old = time.time() - 48 * 3600
+        os.utime(self.config, (old, old))
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(1, len(list(self.target.glob('*.tar.gz'))))
+
+    def test_manual_jobs_run_only_when_selected(self):
+        job = self.daily_job()
+        del job['schedule']
+        self.write_config({'local': job})
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual([], list(self.target.iterdir()))
+        result = self.run_backup('local')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(1, len(list(self.target.glob('*.tar.gz'))))
+
+    def test_failed_due_job_is_retried_on_next_poll(self):
+        marker = self.root / 'ready'
+        job = self.daily_job()
+        job['sources'] = [{'type': 'command', 'command': f'test -e "{marker}" && cat "{self.source}"'}]
+        self.write_config({'local': job})
+        old = time.time() - 48 * 3600
+        os.utime(self.config, (old, old))
+        self.assertNotEqual(0, self.run_backup().returncode)
+        self.assertEqual([], list(self.target.iterdir()))
+        marker.touch()
+        result = self.run_backup()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(1, len(list(self.target.glob('*.tar.gz'))))
+
+    def test_cron_poll_does_not_queue_behind_a_running_backup(self):
+        started, release = self.root / 'started', self.root / 'release'
+        job = self.daily_job()
+        job['sources'] = [{'type': 'command', 'command':
+                          f'touch "{started}"; while [ ! -e "{release}" ]; do sleep .05; done; printf fixture'}]
+        self.write_config({'local': job})
+        first = subprocess.Popen([str(ROOT / 'backuphelper.sh'), '--config', str(self.config), 'local'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            self.assertTrue(started.exists())
+            result = self.run_backup()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIsNone(first.poll())
+        finally:
+            release.touch()
+            first.communicate(timeout=10)
 
     def test_different_jobs_from_concurrent_calls_wait_for_each_other(self):
         events = self.root / 'events'
@@ -86,99 +170,6 @@ class BackupTest(unittest.TestCase):
                     if process.poll() is None:
                         process.kill()
                     process.communicate()
-
-
-class SchedulerTest(unittest.TestCase):
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.units = self.root / 'units'
-        self.units.mkdir()
-        self.bin = self.root / 'bin'
-        self.bin.mkdir()
-        self.calls = self.root / 'calls'
-        self.config = self.root / 'config.yaml'
-        self.installer = self.root / 'install-systemd.sh'
-        self.installer.write_text((ROOT / 'install-systemd.sh').read_text().replace(
-            '/etc/systemd/system', str(self.units)))
-        control = self.bin / 'systemctl'
-        control.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
-                           'with open(os.environ["TEST_CALLS"], "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")\n')
-        control.chmod(0o755)
-        self.environment = {**os.environ, 'PATH': str(self.bin) + ':' + os.environ['PATH'],
-                            'TEST_CALLS': str(self.calls)}
-
-    def install(self, config, runner='/usr/bin/true', arguments=()):
-        self.config.write_text(json.dumps(config))
-        return subprocess.run(['bash', str(self.installer), '--config', str(self.config),
-                               '--user', subprocess.check_output(['id', '-un'], text=True).strip(), '--', runner, *arguments],
-                              env=self.environment, capture_output=True, text=True, timeout=15)
-
-    def test_calendar_timers_are_persistent_and_manual_jobs_have_no_timer(self):
-        result = self.install({'daily': {'schedule': '*-*-* 01:00:00'},
-                               'weekly': {'schedule': 'Sun *-*-* 00:30:00'}, 'manual': {}})
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        for name, calendar in [('daily', '*-*-* 01:00:00'), ('weekly', 'Sun *-*-* 00:30:00')]:
-            timer = self.units / f'backuphelper-{name}.timer'
-            text = timer.read_text()
-            self.assertIn(f'OnCalendar={calendar}\n', text)
-            self.assertIn('Persistent=true\n', text)
-            self.assertIn(f'Unit=backuphelper@{name}.service\n', text)
-        self.assertFalse((self.units / 'backuphelper-manual.timer').exists())
-        service = (self.units / 'backuphelper@.service').read_text()
-        self.assertIn('"--config"', service)
-        self.assertIn(' %i\n', service)
-        verify = subprocess.run(['systemd-analyze', 'verify', *map(str, self.units.iterdir())],
-                                capture_output=True, text=True)
-        self.assertEqual(0, verify.returncode, verify.stderr)
-
-    def test_invalid_schedule_or_legacy_interval_changes_nothing(self):
-        for invalid in [{'schedule': 'not a calendar'}, {'schedule': 'daily\nUnit=other.service'}, {'interval': 20}]:
-            with self.subTest(invalid=invalid):
-                result = self.install({'valid': {'schedule': 'daily'}, 'invalid': invalid})
-                self.assertNotEqual(0, result.returncode)
-                self.assertEqual([], list(self.units.iterdir()))
-                self.assertFalse(self.calls.exists())
-
-    def test_removed_jobs_are_disabled_but_unrelated_timers_remain(self):
-        result = self.install({'old': {'schedule': 'daily'}})
-        self.assertEqual(0, result.returncode, result.stderr)
-        custom = self.units / 'backuphelper-personal.timer'
-        custom.write_text('[Timer]\nOnCalendar=weekly\n')
-        self.calls.write_text('')
-        result = self.install({'new': {'schedule': 'daily'}})
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertFalse((self.units / 'backuphelper-old.timer').exists())
-        self.assertTrue(custom.exists())
-        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
-        self.assertIn(['disable', '--now', 'backuphelper-old.timer'], calls)
-        self.assertFalse(any('backuphelper-personal.timer' in call for call in calls))
-
-    def test_runner_arguments_keep_systemd_metacharacters_literal(self):
-        result = self.install({'daily': {'schedule': 'daily'}}, arguments=('100%', '$HOME " \\ test'))
-        self.assertEqual(0, result.returncode, result.stderr)
-        service = (self.units / 'backuphelper@.service').read_text()
-        self.assertIn('%%', service)
-        self.assertIn('$$', service)
-        self.assertIn('\\"', service)
-        self.assertIn('\\\\', service)
-
-    def test_invalid_service_definition_changes_nothing(self):
-        runner = self.root / 'unsupported " executable'
-        shutil.copy('/usr/bin/true', runner)
-        result = self.install({'daily': {'schedule': 'daily'}}, str(runner))
-        self.assertNotEqual(0, result.returncode)
-        self.assertEqual([], list(self.units.iterdir()))
-        self.assertFalse(self.calls.exists())
-
-    def test_config_path_keeps_the_alias_used_inside_a_container(self):
-        alias = self.root / 'mounted-alias'
-        alias.symlink_to(self.root, target_is_directory=True)
-        self.config = alias / 'config.yaml'
-        result = self.install({'daily': {'schedule': 'daily'}})
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn(f'"{self.config}"', (self.units / 'backuphelper@.service').read_text())
 
 
 if __name__ == '__main__':
