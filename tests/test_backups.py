@@ -49,6 +49,8 @@ class BackupTest(unittest.TestCase):
         subprocess.run(['git', 'add', '.'], cwd=repository, check=True)
         subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
                         'commit', '-qm', 'fixture'], cwd=repository, check=True)
+        committed = (repository / 'unchanged').stat()
+        os.utime(repository / 'unchanged', ns=(committed.st_atime_ns, committed.st_mtime_ns + 2_000_000_000))
         (repository / 'modified').write_text('working tree\n')
         (repository / 'staged').write_text('staged change\n')
         (repository / 'new staged').write_text('new staged file\n')

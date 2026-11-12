@@ -108,11 +108,12 @@ git_files() {
             continue
         fi
         {
-            git -C "$folder" ls-files -z --others --modified --exclude-standard
+            git -C "$folder" ls-files -z --others --exclude-standard
+            git -C "$folder" diff --name-only -z
             git -C "$folder" ls-files -z --others --ignored --exclude-standard --directory
             git -C "$folder" diff --cached --name-only -z --diff-filter=ACMRT
         } < /dev/null | sort -zu | while IFS= read -r -d '' file; do
-            # --modified also lists deleted files
+            # deleted files have no payload
             if [[ -e "$folder/$file" || -L "$folder/$file" ]] && ! excluded "$file"; then printf '%s\0' "$folder/$file"; fi
         done
     done
