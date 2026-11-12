@@ -22,6 +22,12 @@ local:
 
 remote:
     sources:
+        # optional ssh destination and arguments; the server needs bash, git, sort and tar
+        - type: git
+          ssh: user@example.com
+          ssh_options: [-p, '22', -i, /home/user/.ssh/id_ed25519]
+          path: /var/www
+          skip: [big-uploads]
         # the password is passed via stdin, so it neither shows up in the remote command line nor in a process list
         - type: command
           command: |

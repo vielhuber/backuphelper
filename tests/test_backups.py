@@ -34,6 +34,101 @@ class BackupTest(unittest.TestCase):
                 'schedule': f'0 {(time.localtime().tm_hour + 2) % 24} * * *',
                 'sources': [{'type': 'path', 'path': str(self.source)}]}
 
+    def test_git_sources_select_the_same_files_locally_and_over_ssh(self):
+        parent = self.root / "projects with 'quotes'"
+        repository = parent / 'project'
+        repository.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+        for name in ('unchanged', 'modified', 'staged', 'deleted'):
+            (repository / name).write_text('committed\n')
+        for directory in ('cache', 'cacheable', 'backwpup', 'backwpup-backups', 'backwpup-restore'):
+            nested = repository / 'deep' / directory
+            nested.mkdir(parents=True)
+            (nested / 'data').write_text('committed\n')
+        (repository / '.gitignore').write_text('.env\nvendor/\n')
+        subprocess.run(['git', 'add', '.'], cwd=repository, check=True)
+        subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+                        'commit', '-qm', 'fixture'], cwd=repository, check=True)
+        (repository / 'modified').write_text('working tree\n')
+        (repository / 'staged').write_text('staged change\n')
+        (repository / 'new staged').write_text('new staged file\n')
+        subprocess.run(['git', 'add', 'staged', 'new staged'], cwd=repository, check=True)
+        (repository / 'deleted').unlink()
+        for directory in (repository / 'deep').iterdir():
+            (directory / 'data').write_text('modified\n')
+        (repository / 'untracked\nfile').write_text('untracked\n')
+        (repository / '.env').write_text('fixture\n')
+        (repository / 'vendor').mkdir()
+        (repository / 'vendor' / 'ignored').write_text('excluded\n')
+        (parent / 'plain').mkdir()
+        (parent / 'plain' / 'data').write_text('plain directory\n')
+        for directory in ('cache', 'cacheable', 'backwpup-backups'):
+            nested = parent / 'plain' / 'deep' / directory
+            nested.mkdir(parents=True)
+            (nested / 'data').write_text('plain directory\n')
+        (parent / 'skip').mkdir()
+        (parent / 'skip' / 'data').write_text('skipped\n')
+        binary = self.root / 'bin'
+        binary.mkdir()
+        ssh = binary / 'ssh'
+        ssh.write_text('#!/usr/bin/env python3\nimport os, sys\n'
+                       'assert sys.argv[1:6] == ["-o", "BatchMode=yes", "-p", "2222", "fixture"]\n'
+                       'os.execvp("bash", ["bash", "-c", sys.argv[6]])\n')
+        ssh.chmod(0o755)
+        expected = {str(repository / name)[1:] for name in
+                    ('modified', 'staged', 'new staged', 'untracked\nfile', '.env')}
+        expected.add(str(parent / 'plain' / 'data')[1:])
+        expected.add(str(repository / 'deep' / 'cacheable' / 'data')[1:])
+        expected.add(str(parent / 'plain' / 'deep' / 'cacheable' / 'data')[1:])
+        for remote, exclusions in ((False, ['vendor', 'backwpup*', 'cache']),
+                                   (True, ['vendor', 'backwpup*', 'cache']), (True, [])):
+            with self.subTest(remote=remote, exclusions=exclusions):
+                expected_files = expected.copy()
+                if not exclusions:
+                    expected_files.add(str(repository / 'vendor' / 'ignored')[1:])
+                    for directory in ('cache', 'backwpup', 'backwpup-backups', 'backwpup-restore'):
+                        expected_files.add(str(repository / 'deep' / directory / 'data')[1:])
+                    for directory in ('cache', 'backwpup-backups'):
+                        expected_files.add(str(parent / 'plain' / 'deep' / directory / 'data')[1:])
+                source = {'type': 'git', 'path': str(parent), 'skip': ['skip']}
+                if remote:
+                    source.update(ssh='fixture', ssh_options=['-p', '2222'])
+                self.write_config({'local': {'target': str(self.target), 'keep': 2,
+                                            'exclude': exclusions, 'sources': [source]}})
+                result = subprocess.run([str(ROOT / 'backuphelper.sh'), '--config', str(self.config), 'local'],
+                                        capture_output=True, text=True, timeout=15,
+                                        env={**os.environ, 'PATH': f'{binary}:{os.environ["PATH"]}'})
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                archive = next(self.target.glob('local-*.tar.gz'))
+                with tarfile.open(archive) as outer:
+                    if remote:
+                        self.assertEqual(['git-1.tar'], outer.getnames())
+                        with tarfile.open(fileobj=outer.extractfile('git-1.tar')) as contents:
+                            self.assertEqual(expected_files, {m.name for m in contents if m.isfile()})
+                    else:
+                        self.assertEqual(expected_files, {m.name for m in outer if m.isfile()})
+                archive.unlink()
+        (parent / 'broken' / '.git').mkdir(parents=True)
+        result = subprocess.run([str(ROOT / 'backuphelper.sh'), '--config', str(self.config), 'local'],
+                                capture_output=True, text=True, timeout=15,
+                                env={**os.environ, 'PATH': f'{binary}:{os.environ["PATH"]}'})
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], list(self.target.iterdir()))
+
+    def test_failed_ssh_git_source_does_not_publish_an_archive(self):
+        binary = self.root / 'bin'
+        binary.mkdir()
+        ssh = binary / 'ssh'
+        ssh.write_text('#!/bin/sh\nprintf partial\nexit 255\n')
+        ssh.chmod(0o755)
+        self.write_config({'remote': {'target': str(self.target), 'keep': 2,
+                                     'sources': [{'type': 'git', 'path': '/projects', 'ssh': 'fixture'}]}})
+        result = subprocess.run([str(ROOT / 'backuphelper.sh'), '--config', str(self.config), 'remote'],
+                                capture_output=True, text=True, timeout=15,
+                                env={**os.environ, 'PATH': f'{binary}:{os.environ["PATH"]}'})
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], list(self.target.iterdir()))
+
     def test_manual_backup_runs_with_or_without_a_schedule(self):
         for schedule in (None, '0 1 * * *'):
             with self.subTest(schedule=schedule):

@@ -90,31 +90,56 @@ excluded() {
 }
 
 # git checkouts below the path contribute untracked, ignored and modified files, other folders everything
-collect_git() {
-    local path folder skip folders position=0
-    path=$(field path)
-    [[ "$path" = /* ]] || fail "$job: git source needs an absolute path"
-    mapfile -t skip < <(field skip)
+git_files() {
+    local path=$1 count=$2 folder file position=0
+    shift 2
+    local -a skip=("${@:1:count}") exclude folders
+    shift "$count"
+    exclude=("$@")
+    [[ -d "$path" ]] || { printf 'git source directory not found: %s\n' "$path" >&2; return 1; }
     folders=("$path"/*/)
-    log "📂 $job $1: git $path (${#folders[@]} folders)"
     for folder in "${folders[@]}"; do
         folder=${folder%/}
         position=$((position + 1))
         progress "$position/${#folders[@]} ${folder##*/}"
         if contains "${folder##*/}" "${skip[@]}"; then continue; fi
         if [[ ! -e "$folder/.git" ]]; then
-            printf '%s\0' "$folder" >> "$list"
+            printf '%s\0' "$folder"
             continue
         fi
         {
             git -C "$folder" ls-files -z --others --modified --exclude-standard
             git -C "$folder" ls-files -z --others --ignored --exclude-standard --directory
-        } < /dev/null | while IFS= read -r -d '' file; do
+            git -C "$folder" diff --cached --name-only -z --diff-filter=ACMRT
+        } < /dev/null | sort -zu | while IFS= read -r -d '' file; do
             # --modified also lists deleted files
             if [[ -e "$folder/$file" || -L "$folder/$file" ]] && ! excluded "$file"; then printf '%s\0' "$folder/$file"; fi
-        done >> "$list"
+        done
     done
     progress
+}
+
+collect_git() {
+    local path remote invocation name="git-$1.tar"
+    local -a skip ssh_options
+    path=$(field path)
+    [[ "$path" = /* ]] || fail "$job: git source needs an absolute path"
+    mapfile -t skip < <(field skip)
+    remote=$(field ssh)
+    log "📂 $job $2: git ${remote:+$remote:}$path"
+    if [[ -z "$remote" ]]; then
+        git_files "$path" "${#skip[@]}" "${skip[@]}" "${exclude[@]}" >> "$list"
+        return
+    fi
+    mapfile -t ssh_options < <(field ssh_options)
+    printf -v invocation '%q ' git_files "$path" "${#skip[@]}" "${skip[@]}" "${exclude[@]}"
+    {
+        printf '%s\n' 'set -euo pipefail' 'shopt -s nullglob dotglob' "$(declare -f progress contains excluded git_files)"
+        printf '%s | { tar -cf - --ignore-failed-read --warning=no-file-changed ' "$invocation"
+        if (( ${#exclude[@]} )); then printf '%q ' "${exclude[@]/#/--exclude=}"; fi
+        printf '%s\n' '-C / --null -T - || [[ $? == 1 ]]; }'
+    } | ssh -o BatchMode=yes "${ssh_options[@]}" "$remote" 'bash -s' | pv -N "$name" > "$staging/$name"
+    printf '%s\0' "$staging/$name" >> "$list"
 }
 
 # the output is named after the position of the source, so no part of the command (e.g. a password) ends up in a file name
@@ -168,7 +193,7 @@ run_job() {
     fi
     rm -f -- "$target/$job"-*.partial
     log "🚀 $job: started"
-    staging=$(mktemp -d /tmp/backuphelper.XXXXXX)
+    staging=$(mktemp -d "$target/.backuphelper.XXXXXX")
     list="$staging/.files"
     trap cleanup EXIT
     : > "$list"
@@ -184,7 +209,7 @@ run_job() {
                 log "📄 $job $step: path $(field path)"
                 printf '%s\0' "$(field path)" >> "$list"
                 ;;
-            git) collect_git "$step" ;;
+            git) collect_git "$((index + 1))" "$step" ;;
             command) collect_command "$((index + 1))" "$step" ;;
             *) fail "$job: source type must be path, git or command" ;;
         esac
