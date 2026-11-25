@@ -50,6 +50,7 @@ for tool in yq jq tar gzip git flock pv; do
     command -v "$tool" > /dev/null || fail "$tool is missing"
 done
 [[ -f "$CONFIG" ]] || fail "config $CONFIG not found"
+[[ -r "$CONFIG" ]] || fail "config $CONFIG is not readable"
 CONFIG=$(readlink -f "$CONFIG")
 # Manual calls wait for the current run; cron polls skip it without building a queue.
 exec 8> "/tmp/backuphelper-run-$(printf '%s' "$CONFIG" | md5sum | cut -c1-32).lock"
