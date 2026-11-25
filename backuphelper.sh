@@ -159,6 +159,7 @@ cleanup() {
 
 run_job() {
     local target keep schedule='' newest since index step source sources exclude archive size outdated status=0
+    local timestamp success_url response_code
     target=$(setting target "")
     keep=$(setting keep "")
     if jq -e --arg job "$job" '.[$job] | has("interval")' <<< "$SETTINGS" > /dev/null; then
@@ -216,7 +217,8 @@ run_job() {
         esac
     done
 
-    archive="$target/$job-$(date +%Y-%m-%d-%H%M%S).tar.gz"
+    timestamp=$(date +%Y-%m-%d-%H%M%S)
+    archive="$target/$job-$timestamp.tar.gz"
     # only drives the progress estimate; du applies name patterns like tar, path patterns are ignored
     size=$({ du -cb "${exclude[@]/#/--exclude=}" --files0-from="$list" 2> /dev/null || true; } | tail -n 1 | cut -f1)
     log "📦 $job: packing about $(numfmt --to=iec-i --suffix=B "${size:-0}")"
@@ -235,6 +237,24 @@ run_job() {
         log "🧹 $job: removed ${#outdated[@]} old archive(s)"
     fi
     log "✅ $job: $archive ($(du -h "$archive" | cut -f1))"
+    success_url=$(setting on_success_url "")
+    if [[ -n "$success_url" ]]; then
+        success_url=${success_url//\$BACKUP_NAME\$/$job}
+        success_url=${success_url//\$BACKUP_DATE\$/${timestamp:0:10}}
+        # Pass the URL through curl's config stream to keep query tokens out of argv.
+        success_url=${success_url//\\/\\\\}
+        success_url=${success_url//\"/\\\"}
+        response_code=''
+        if [[ "$success_url" = http://* || "$success_url" = https://* ]] && [[ "$success_url" != *[$'\r\n']* ]] \
+            && response_code=$(printf 'url = "%s"\n' "$success_url" \
+                | curl --disable --silent --globoff --output /dev/null --write-out '%{http_code}' \
+                    --proto '=http,https' --connect-timeout 5 --max-time 10 --config - 2> /dev/null) \
+            && [[ "$response_code" = 2[0-9][0-9] ]]; then
+            log "🔔 $job: success URL notified"
+        else
+            log "⚠️ $job: success URL failed${response_code:+ (HTTP $response_code)}"
+        fi
+    fi
 }
 
 # every job runs in its own subshell, so a failing job neither stops the others nor leaks its state

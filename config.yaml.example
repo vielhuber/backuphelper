@@ -19,6 +19,8 @@ local:
     schedule: '0 1 * * *'
     # optional: tar exclude patterns
     exclude: [node_modules, vendor, .cache, syncdb/cache]
+    # optional: HTTP GET on success (requires curl)
+    # on_success_url: 'https://monitor.example/backup?name=$BACKUP_NAME$&date=$BACKUP_DATE$'
 
 remote:
     sources:

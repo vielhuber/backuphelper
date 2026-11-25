@@ -1,11 +1,14 @@
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+from threading import Thread
 import time
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,6 +216,56 @@ class BackupTest(unittest.TestCase):
         result = self.run_backup()
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual(1, len(list(self.target.glob('*.tar.gz'))))
+
+    def test_success_url_notifies_after_publishing_an_archive(self):
+        requests = []
+        target = self.target
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, sorted(file.name for file in target.glob('*.tar.gz'))))
+                self.send_response(503 if self.path.startswith('/unavailable') else 204)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        with HTTPServer(('127.0.0.1', 0), Handler) as server:
+            listener = Thread(target=server.serve_forever)
+            listener.start()
+            try:
+                url = f'http://127.0.0.1:{server.server_port}/'
+                job = {**self.daily_job(), 'on_success_url': url + '?name=$BACKUP_NAME$&date=$BACKUP_DATE$'}
+                broken = {**job, 'sources': [{'type': 'command', 'command': 'exit 5'}]}
+                unavailable = {**job, 'on_success_url': url + 'unavailable?token=private-marker'}
+                del broken['schedule'], unavailable['schedule']
+                self.write_config({'fachlehrer': job, 'broken': broken, 'unavailable': unavailable})
+                self.assertEqual(0, self.run_backup().returncode)
+                self.assertNotEqual(0, self.run_backup('broken').returncode)
+                self.assertEqual([], requests)
+
+                old = time.time() - 48 * 3600
+                os.utime(self.config, (old, old))
+                result = self.run_backup()
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual(1, len(requests))
+                requested_url, archives = requests[0]
+                archive = next(self.target.glob('fachlehrer-*.tar.gz'))
+                self.assertEqual([archive.name], archives)
+                self.assertEqual({'name': ['fachlehrer'], 'date': [archive.name[len('fachlehrer-'):][:10]]},
+                                 parse_qs(urlsplit(requested_url).query))
+                self.assertEqual(0, self.run_backup().returncode)
+                self.assertEqual(1, len(requests))
+
+                result = self.run_backup('unavailable')
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual(2, len(requests))
+                self.assertIn('HTTP 503', result.stdout)
+                self.assertNotIn('private-marker', result.stdout + result.stderr)
+                self.assertEqual(1, len(list(self.target.glob('unavailable-*.tar.gz'))))
+            finally:
+                server.shutdown()
+                listener.join()
 
     def test_cron_poll_does_not_queue_behind_a_running_backup(self):
         started, release = self.root / 'started', self.root / 'release'

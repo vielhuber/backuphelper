@@ -46,6 +46,8 @@ local:
     schedule: '0 1 * * *'
     # optional: tar exclude patterns
     exclude: [node_modules, vendor, .cache, syncdb/cache]
+    # optional: HTTP GET on success (requires curl)
+    on_success_url: 'https://monitor.example/backup?name=$BACKUP_NAME$&date=$BACKUP_DATE$'
 
 remote:
     sources:
@@ -65,6 +67,8 @@ remote:
     keep: 7
     schedule: '30 0 * * 0'
 ```
+
+`$BACKUP_NAME$` is the job key and `$BACKUP_DATE$` is the archive date (`YYYY-MM-DD`). The request runs after a new archive is saved. A failed request is logged as a warning and the archive is kept.
 
 ## scheduling
 
